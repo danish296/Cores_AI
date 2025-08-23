@@ -30,7 +30,8 @@ TELEGRAM_TOKEN, MISTRAL_API_KEY, SUPABASE_URL, SUPABASE_KEY, SERPAPI_API_KEY = (
 # --- Initialize Clients ---
 mistral_client = MistralClient(api_key=MISTRAL_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+# Use this smaller model to save memory
+embedding_model = SentenceTransformer('sentence-transformers/paraphrase-albert-small-v2')
 print("Embedding model loaded successfully.")
 
 # --- Initialize FastAPI ---
