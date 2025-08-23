@@ -1,36 +1,49 @@
+# bot.py (Version 5 - With Web Endpoint - FIXED)
 import os
 import logging
-from dotenv import load_dotenv
 import json
+import asyncio
 import re
-
-# --- Imports ---
+import uvicorn
+from dotenv import load_dotenv
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
 from mistralai.client import MistralClient
-from serpapi import GoogleSearch # New import for web search
+from serpapi import GoogleSearch
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import threading
 
-# --- Basic Setup ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# --- Basic Setup & Client Initialization ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 load_dotenv()
 
 # --- Load API Keys ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY") # New key for search
+TELEGRAM_TOKEN, MISTRAL_API_KEY, SUPABASE_URL, SUPABASE_KEY, SERPAPI_API_KEY = (
+    os.getenv("TELEGRAM_TOKEN"), os.getenv("MISTRAL_API_KEY"), os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY"), os.getenv("SERPAPI_API_KEY")
+)
 
 # --- Initialize Clients ---
 mistral_client = MistralClient(api_key=MISTRAL_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Embedding model loaded successfully.")
+
+# --- Initialize FastAPI ---
+app = FastAPI(title="AI Bot API", version="1.0.0")
+
+# --- Add CORS middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins, restrict this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # --- Helper Functions ---
 
@@ -52,51 +65,28 @@ def extract_name_from_message(message):
 def perform_web_search(query: str) -> str:
     """Performs a web search using SerpApi and returns a summary of results."""
     try:
-        params = {
-            "q": query,
-            "api_key": SERPAPI_API_KEY,
-            "engine": "google",
-        }
+        params = {"q": query, "api_key": SERPAPI_API_KEY, "engine": "google"}
         search = GoogleSearch(params)
         results = search.get_dict()
-        
-        # Extract snippets from organic results for context
-        snippets = []
-        if "organic_results" in results:
-            for result in results["organic_results"][:4]: # Get top 4 results
-                if "snippet" in result:
-                    snippets.append(result["snippet"])
-        
+        snippets = [res["snippet"] for res in results.get("organic_results", [])[:4] if "snippet" in res]
         if "answer_box" in results and "snippet" in results["answer_box"]:
              return results["answer_box"]["snippet"]
-
         print(f"Found {len(snippets)} snippets from web search.")
         return " ".join(snippets) if snippets else "No results found."
     except Exception as e:
         print(f"Error in web search: {e}")
-        return "Sorry, I couldn't perform a web search at this time."
+        return f"Error in web search: {e}"
 
-# --- Telegram Bot Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_name = update.effective_user.first_name
-    await update.message.reply_html(
-        f"Hi {user_name}! I can now search the web and remember our conversations. Ask me anything!"
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_message = update.message.text
-    user_id = update.effective_user.id
-    
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
-
+# --- Core Bot Logic (Refactored for reuse) ---
+async def get_bot_response(user_id: int, user_message: str) -> str:
+    """Core bot logic that can be used by both Telegram and Web API"""
     try:
-        # 1. **ALWAYS SEARCH MEMORY FIRST** - This was the key missing piece!
+        # 1. **ALWAYS SEARCH MEMORY FIRST**
         message_embedding = embedding_model.encode(user_message).tolist()
         params = {
             'query_embedding': message_embedding,
-            'match_threshold': 0.3,  # Keep the lower threshold for better recall
-            'match_count': 8,        # Keep higher count
+            'match_threshold': 0.3,
+            'match_count': 8,
             'p_user_id': int(user_id)
         }
         memories = supabase.rpc('match_memories', params).execute()
@@ -108,7 +98,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for memory in memories.data:
                 memory_context += f"- {memory['content']}\n"
 
-        # 2. **PLANNING STEP**: Decide if a web search is needed.
+        # 2. **PLANNING STEP**: Decide if web search is needed
         planning_prompt = (
             f"You are a smart router. Based on the user's message, decide if you need to search the web. "
             f"If the question is about current events, news, recent information, specific facts about companies/people, "
@@ -121,7 +111,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         planning_response = mistral_client.chat(
             model="mistral-small-latest",
             messages=[{"role": "user", "content": planning_prompt}],
-            response_format={"type": "json_object"} # Force JSON output
+            response_format={"type": "json_object"}
         )
         
         decision_json = json.loads(planning_response.choices[0].message.content)
@@ -137,7 +127,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             print("Decision: Using memory only, no web search needed.")
 
-        # 4. **RESPONSE GENERATION**: Combine memory + web search (if any)
+        # 4. **RESPONSE GENERATION**: Combine memory + web search
         final_system_instruction = (
             "You are a helpful AI assistant with memory and web search capabilities. IMPORTANT RULES:\n"
             "1. If MEMORY contains the user's name or personal info, ALWAYS use it\n"
@@ -163,7 +153,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         bot_response = final_response.choices[0].message.content
 
-        # 5. **SAVE MEMORY** - Keep the enhanced version with name extraction
+        # 5. **SAVE MEMORY**
         # Save the user's message
         memory_to_save = f"User said: '{user_message}'"
         embedding = embedding_model.encode(memory_to_save).tolist()
@@ -184,20 +174,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 'embedding': name_embedding
             }).execute()
             print(f"Saved name memory: '{name_memory}'")
-        
-        await update.message.reply_text(bot_response)
+
+        return bot_response
 
     except Exception as e:
-        logging.error(f"An error occurred in handle_message: {e}")
-        await update.message.reply_text("Sorry, something went wrong. Please try again.")
+        logging.error(f"Error in get_bot_response: {e}")
+        return "Sorry, something went wrong. Please try again."
 
-# --- Main Bot Execution ---
-def main() -> None:
+# --- FastAPI Models ---
+class ChatRequest(BaseModel):
+    user_id: int
+    message: str
+
+class ChatResponse(BaseModel):
+    response: str
+
+# --- FastAPI Endpoints ---
+@app.get("/")
+async def root():
+    return {"message": "AI Bot API is running!", "version": "1.0.0"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Web API endpoint for chatting with the bot"""
+    bot_response = await get_bot_response(request.user_id, request.message)
+    return ChatResponse(response=bot_response)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "telegram_bot": "running", "web_api": "running"}
+
+# --- Telegram Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_name = update.effective_user.first_name
+    await update.message.reply_html(
+        f"Hi {user_name}! I can remember our conversations and search the web. Ask me anything!"
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_message = update.message.text
+    user_id = update.effective_user.id
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+    
+    # Use the same core logic as the web API
+    bot_response = await get_bot_response(user_id, user_message)
+    await update.message.reply_text(bot_response)
+
+# --- Main Application Runner ---
+def run_telegram_bot():
+    """Run Telegram bot in a separate thread"""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot with web search and memory is running...")
+    print("Telegram bot is running...")
     application.run_polling()
 
+def run_fastapi():
+    """Run FastAPI server"""
+    print("FastAPI server starting on http://localhost:8000")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
 if __name__ == '__main__':
-    main()
+    # Run both Telegram bot and FastAPI server
+    print("Starting AI Bot with both Telegram and Web API...")
+    
+    # Start Telegram bot in a separate thread
+    telegram_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+    telegram_thread.start()
+    
+    # Start FastAPI server (blocking)
+    run_fastapi()
