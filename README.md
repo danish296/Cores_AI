@@ -100,9 +100,30 @@ Follow these steps to get a local copy up and running.
 ## Usage
 
 To run the bot locally for development (which starts both the Telegram bot and the FastAPI web server):
-```bash
+bash
 python bot.py
 
+Your Telegram bot will start polling for messages, and the web API will be available at http://localhost:8000.
+
+Deployment
+The backend is designed for deployment on services like Render. The main branch is configured to run as a FastAPI web service using Gunicorn.
+
+Push the code to a GitHub repository.
+
+Create a new "Web Service" on Render and connect your repository.
+
+Use the following settings:
+
+Runtime: Python 3
+
+Build Command: pip install -r requirements.txt
+
+Start Command: gunicorn -w 1 -k uvicorn.workers.UvicornWorker bot:app
+
+Add your environment variables in the Render dashboard.
+
+Set the Telegram webhook to your new Render URL.
+```
 ***
 How to Clone and Run This Project on Another PC 💻
 
